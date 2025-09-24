@@ -1,0 +1,29 @@
+# docker-compose.yml
+version: "3.9"
+
+services:
+  app:
+    image: pdf-rgb-cleaner:latest
+    build: .
+    # O ENTRYPOINT no container chama /app/entrypoint.sh, que já define:
+    #   -i /data/Input -o /data/Output --dpi 300 --text-dir /data/OutputTxt
+    # Aqui só anexamos opções extras úteis por padrão.
+    command:
+      [
+        "--extract-text",
+        "--ocr-lang",
+        "por+eng",
+        "--rgb-min",
+        "170",
+        "--rgb-max",
+        "250",
+        "--preview-mask",
+        "--overlay",
+      ]
+    volumes:
+      - ./data:/data
+    # Executa como job batch; termina ao concluir.
+    restart: "no"
+    # Para saída de logs estável
+    tty: true
+    init: true

@@ -1,10 +1,13 @@
-# file: scripts/batch_recursive_pdf_remove_with_previews.py
+# =========================
+# pdf_batch_remove_with_previews_and_ocr.py
+# =========================
 from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
 import os
 import sys
+import platform
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -23,7 +26,7 @@ class RGBThresholds:
     gmax: int
     bmin: int
     bmax: int
-    inclusive: bool  # True: >=,<= ; False: >,<
+    inclusive: bool
 
     def validate(self) -> None:
         for name, val in [
@@ -70,17 +73,15 @@ def build_mask(
         mg = (g > th.gmin) & (g < th.gmax)
         mb = (b > th.bmin) & (b < th.bmax)
     mask_rgb = mr & mg & mb
-
     if not apply_judge_region:
         return mask_rgb
-
     h, w = r.shape
     yy, xx = np.mgrid[0:h, 0:w]
     region = (-(600.0 / 1575.0) * xx + 1350 < yy) & (yy < -(600.0 / 1575.0) * xx + 1500)
     return mask_rgb & region
 
 
-# -------------------- Remoção (principal) --------------------
+# -------------------- Saída principal --------------------
 def handle_remove_to_white(imgs: np.ndarray, mask: np.ndarray) -> np.ndarray:
     imgs = ensure_rgb(imgs)
     out = imgs.copy()
@@ -122,6 +123,94 @@ def make_overlay(
     return np.clip(np.rint(out), 0, 255).astype(np.uint8)
 
 
+# -------------------- Tesseract helpers --------------------
+def detect_tesseract_cmd(user_cmd: Optional[str]) -> Optional[str]:
+    if user_cmd:
+        return user_cmd
+    exe = None
+    system = platform.system().lower()
+    candidates: List[str] = []
+    if system == "darwin":
+        candidates += ["/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"]
+    elif system == "windows":
+        candidates += [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        ]
+    else:
+        candidates += ["/usr/bin/tesseract", "/usr/local/bin/tesseract"]
+    for c in candidates:
+        if Path(c).exists():
+            exe = c
+            break
+    return exe
+
+
+def detect_tessdata_dir(user_dir: Optional[str]) -> Optional[str]:
+    if user_dir:
+        return user_dir
+    system = platform.system().lower()
+    candidates: List[str] = []
+    if system == "darwin":
+        candidates += ["/opt/homebrew/share/tessdata", "/usr/local/share/tessdata"]
+    elif system == "windows":
+        candidates += [
+            r"C:\Program Files\Tesseract-OCR\tessdata",
+            r"C:\Program Files (x86)\Tesseract-OCR\tessdata",
+        ]
+    else:
+        candidates += [
+            "/usr/share/tesseract-ocr/5/tessdata",
+            "/usr/share/tesseract-ocr/4.00/tessdata",
+            "/usr/share/tesseract-ocr/tessdata",
+        ]
+    for c in candidates:
+        if Path(c).exists():
+            return c
+    return None
+
+
+# -------------------- OCR --------------------
+def ocr_pages_to_text(
+    pages: List[Image.Image],
+    lang: str,
+    tesseract_cmd: Optional[str],
+    tessdata_dir: Optional[str],
+) -> str:
+    try:
+        import pytesseract
+    except Exception as e:
+        raise RuntimeError(
+            "pytesseract não está instalado. Adicione 'pytesseract' ao requirements e instale o Tesseract no SO."
+        ) from e
+
+    cmd = detect_tesseract_cmd(tesseract_cmd)
+    if cmd:
+        pytesseract.pytesseract.tesseract_cmd = cmd
+    td = detect_tessdata_dir(tessdata_dir)
+    if td:
+        os.environ["TESSDATA_PREFIX"] = td
+
+    try:
+        available = set(pytesseract.get_languages(config=""))
+    except Exception:
+        available = set()
+
+    requested = [x.strip() for x in (lang or "eng").split("+") if x.strip()]
+    use_lang = "+".join(requested) if not available else None
+    if available:
+        keep = [x for x in requested if x in available]
+        if not keep:
+            keep = ["eng"] if "eng" in available else [next(iter(available))]
+        use_lang = "+".join(keep)
+
+    chunks: List[str] = []
+    for idx, im in enumerate(pages, start=1):
+        txt = pytesseract.image_to_string(im.convert("RGB"), lang=use_lang)
+        chunks.append(f"----- Página {idx} -----\n{txt}".rstrip())
+    return "\n\n".join(chunks).strip() + "\n"
+
+
 # -------------------- Worker --------------------
 def worker(args):
     (
@@ -132,13 +221,18 @@ def worker(args):
         th,
         apply_judge,
         prev_removed_dir,
-        prev_removed_bg,
-        prev_removed_skip,
+        bg_value,
+        prev_skip_empty,
         mask_dir,
         overlay_dir,
         overlay_color,
         overlay_alpha,
         overlay_skip,
+        extract_text,
+        text_dir,
+        ocr_lang,
+        tesseract_cmd,
+        tessdata_dir,
     ) = args
     try:
         out_main = rel_output_path(in_root, out_root, in_pdf)
@@ -161,17 +255,14 @@ def worker(args):
             )
 
             if prev_removed_dir is not None:
-                bg_value, skip_empty = prev_removed_bg, prev_removed_skip
-                if (not skip_empty) or mask.any():
+                if (not prev_skip_empty) or mask.any():
                     preview_removed_pages.append(
                         Image.fromarray(
                             make_only_removed(arr, mask, bg_value), mode="RGB"
                         )
                     )
-
             if mask_dir is not None:
                 mask_pages.append(mask_to_bw(mask))
-
             if overlay_dir is not None:
                 if (not overlay_skip) or mask.any():
                     overlay_pages.append(
@@ -194,7 +285,7 @@ def worker(args):
                     str(out_prev), "PDF", resolution=dpi, save_all=True, append_images=r
                 )
             else:
-                Image.new("RGB", (1, 1), color=(prev_removed_bg,) * 3).save(
+                Image.new("RGB", (1, 1), color=(bg_value,) * 3).save(
                     str(out_prev), "PDF", resolution=dpi
                 )
 
@@ -228,7 +319,26 @@ def worker(args):
                     str(out_overlay), "PDF", resolution=dpi
                 )
 
-        return (True, f"[OK] {in_pdf} -> {out_main} ({len(removed_pages)} pág.)")
+        if extract_text:
+            out_txt = rel_output_path(in_root, text_dir, in_pdf).with_suffix(".txt")
+            out_txt.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                text_content = ocr_pages_to_text(
+                    removed_pages,
+                    lang=ocr_lang,
+                    tesseract_cmd=tesseract_cmd,
+                    tessdata_dir=tessdata_dir,
+                )
+            except Exception as e:
+                text_content = f"[OCR ERRO] {e}\n"
+            with open(out_txt, "w", encoding="utf-8") as fh:
+                fh.write(text_content)
+
+        return (
+            True,
+            f"[OK] {in_pdf} -> {out_main} ({len(removed_pages)} pág.)"
+            + (f" +TXT" if extract_text else ""),
+        )
     except Exception as e:
         return (False, f"[ERRO] {in_pdf}: {e}")
 
@@ -246,7 +356,7 @@ def rel_output_path(input_dir: Path, output_dir: Path, file_path: Path) -> Path:
 # -------------------- CLI --------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Remove pixels por faixa RGB (pintando de branco) e opcionalmente gera previews (só removido, máscara, overlay). Recursivo + paralelo."
+        description="Remove pixels por faixa RGB (pintando de branco) e opcionalmente gera previews e TXT (OCR). Recursivo + paralelo."
     )
     p.add_argument("--input_dir", "-i", type=Path, default=Path("Input"))
     p.add_argument("--output_dir", "-o", type=Path, default=Path("Output"))
@@ -266,38 +376,45 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inclusive", action="store_true")
 
     # Previews opcionais
-    p.add_argument(
-        "--preview-removed",
-        action="store_true",
-        help="Gera PDF com apenas as áreas removidas visíveis.",
-    )
+    p.add_argument("--preview-removed", action="store_true")
     p.add_argument("--removed-dir", type=Path, default=Path("OutputRemoved"))
-    p.add_argument(
-        "--bg",
-        choices=["black", "white"],
-        default="black",
-        help="Fundo do preview 'só removido'.",
-    )
-    p.add_argument(
-        "--skip-empty",
-        action="store_true",
-        help="Não gera páginas de preview quando não há áreas removidas.",
-    )
+    p.add_argument("--bg", choices=["black", "white"], default="black")
+    p.add_argument("--skip-empty", action="store_true")
 
-    p.add_argument(
-        "--preview-mask", action="store_true", help="Gera PDF BW da máscara."
-    )
+    p.add_argument("--preview-mask", action="store_true")
     p.add_argument("--mask-dir", type=Path, default=Path("OutputMask"))
 
-    p.add_argument(
-        "--overlay",
-        action="store_true",
-        help="Gera PDF overlay (áreas removidas destacadas).",
-    )
+    p.add_argument("--overlay", action="store_true")
     p.add_argument("--overlay-dir", type=Path, default=Path("OutputOverlay"))
     p.add_argument("--overlay-color", type=str, default="#ff0000")
     p.add_argument("--overlay-alpha", type=float, default=0.6)
     p.add_argument("--overlay-skip-empty", action="store_true")
+
+    # OCR/Tesseract
+    p.add_argument(
+        "--extract-text",
+        action="store_true",
+        help="Extrai texto (OCR) dos PDFs processados para OutputTXT.",
+    )
+    p.add_argument("--text-dir", type=Path, default=Path("OutputTXT"))
+    p.add_argument(
+        "--ocr-lang",
+        type=str,
+        default="por",
+        help="Idiomas (ex.: 'por', 'eng', 'por+eng').",
+    )
+    p.add_argument(
+        "--tesseract-cmd",
+        type=str,
+        default="",
+        help="Caminho do executável tesseract, se precisar.",
+    )
+    p.add_argument(
+        "--tessdata-dir",
+        type=str,
+        default="",
+        help="Diretório 'tessdata' (define TESSDATA_PREFIX).",
+    )
 
     return p.parse_args()
 
@@ -346,12 +463,14 @@ def main() -> int:
 
     print(
         f"{len(pdfs)} PDF(s) | Limites R[{th.rmin},{th.rmax}] G[{th.gmin},{th.gmax}] B[{th.bmin},{th.bmax}] "
-        f"{'inclusive' if th.inclusive else 'exclusivo'} | workers={workers}"
+        f"{'inclusive' if th.inclusive else 'exclusivo'} | workers={workers} | OCR={'on' if args.extract_text else 'off'}"
     )
 
     prev_removed_dir = args.removed_dir if args.preview_removed else None
     mask_dir = args.mask_dir if args.preview_mask else None
     overlay_dir = args.overlay_dir if args.overlay else None
+    tesseract_cmd = args.tesseract_cmd or None
+    tessdata_dir = args.tessdata_dir or None
 
     tasks = []
     for p in pdfs:
@@ -371,6 +490,11 @@ def main() -> int:
                 overlay_color,
                 overlay_alpha,
                 args.overlay_skip_empty,
+                args.extract_text,
+                args.text_dir,
+                args.ocr_lang,
+                tesseract_cmd,
+                tessdata_dir,
             )
         )
 
@@ -385,6 +509,7 @@ def main() -> int:
 
     print(
         f"Concluído. Sucesso: {ok} | Falhas: {fail} | Output: {out_dir.resolve()}"
+        + (f" | TXT: {args.text_dir.resolve()}" if args.extract_text else "")
         + (f" | Removed: {args.removed_dir.resolve()}" if args.preview_removed else "")
         + (f" | Mask: {args.mask_dir.resolve()}" if args.preview_mask else "")
         + (f" | Overlay: {args.overlay_dir.resolve()}" if args.overlay else "")
