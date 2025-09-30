@@ -1,0 +1,129 @@
+# .github/workflows/windows-portable.yml
+name: Windows Portable ZIP (EXE + Poppler + Tesseract)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "pdf_batch_remove_with_previews_and_ocr.py"
+      - "requirements.txt"
+      - ".github/workflows/windows-portable.yml"
+
+jobs:
+  build-portable:
+    runs-on: windows-latest
+
+    env:
+      # Poppler (ZIP portátil) — fornecido por você:
+      POPPLER_URL: "https://github.com/oschwartz10612/poppler-windows/releases/download/v25.07.0-0/Release-25.07.0-0.zip"
+      # Tessdata (usar 'fast' pela velocidade; troque por 'best' se preferir):
+      TESSDATA_ENG: "https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata"
+      TESSDATA_POR: "https://github.com/tesseract-ocr/tessdata_fast/raw/main/por.traineddata"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install -U pip wheel setuptools pyinstaller
+          python -m pip install -r requirements.txt
+
+      # ---------- Poppler em vendor/poppler ----------
+      - name: Download & expand Poppler (portable ZIP)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path vendor | Out-Null
+          Invoke-WebRequest -Uri $env:POPPLER_URL -OutFile poppler.zip
+          Expand-Archive -Force poppler.zip poppler_extracted
+          if (Test-Path vendor\poppler) { Remove-Item vendor\poppler -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path vendor\poppler | Out-Null
+          # Copia tudo; a release tem 'Library\bin' com pdftoppm.exe
+          Copy-Item poppler_extracted\* vendor\poppler -Recurse -Force
+
+      # ---------- Tesseract em vendor/tesseract ----------
+      # Usamos Chocolatey para instalar Tesseract no runner e depois copiamos.
+      - name: Install Tesseract via Chocolatey
+        shell: pwsh
+        run: |
+          choco install -y tesseract
+          $tessRoot = "C:\Program Files\Tesseract-OCR"
+          if (-not (Test-Path $tessRoot)) {
+            throw "Tesseract não encontrado em $tessRoot após choco install."
+          }
+          if (Test-Path vendor\tesseract) { Remove-Item vendor\tesseract -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path vendor\tesseract | Out-Null
+          Copy-Item "$tessRoot\*" vendor\tesseract -Recurse -Force
+
+      - name: Ensure tessdata (eng/por)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path vendor\tesseract\tessdata | Out-Null
+          $td = "vendor\tesseract\tessdata"
+          if (-not (Test-Path (Join-Path $td "eng.traineddata"))) {
+            Invoke-WebRequest -Uri $env:TESSDATA_ENG -OutFile (Join-Path $td "eng.traineddata")
+          }
+          if (-not (Test-Path (Join-Path $td "por.traineddata"))) {
+            Invoke-WebRequest -Uri $env:TESSDATA_POR -OutFile (Join-Path $td "por.traineddata")
+          }
+
+      - name: Sanity check vendor
+        shell: pwsh
+        run: |
+          Write-Host "Verificando binários:"
+          Get-ChildItem vendor\poppler\ -Recurse | Select-String -Pattern "pdftoppm.exe" -List | ForEach-Object { $_.Filename }
+          Get-ChildItem vendor\tesseract\ -Recurse | Select-String -Pattern "tesseract.exe" -List | ForEach-Object { $_.Filename }
+          if (-not (Test-Path "vendor\poppler\Library\bin\pdftoppm.exe") -and -not (Get-ChildItem vendor\poppler -Recurse | Where-Object {$_.Name -eq "pdftoppm.exe"})) {
+            throw "pdftoppm.exe não encontrado em vendor\poppler\ (verifique a estrutura da release)."
+          }
+          if (-not (Get-ChildItem vendor\tesseract -Recurse | Where-Object {$_.Name -eq "tesseract.exe"})) {
+            throw "tesseract.exe não encontrado em vendor\tesseract\."
+          }
+          if (-not (Test-Path "vendor\tesseract\tessdata\eng.traineddata")) { throw "eng.traineddata ausente." }
+          if (-not (Test-Path "vendor\tesseract\tessdata\por.traineddata")) { throw "por.traineddata ausente." }
+
+      # ---------- PyInstaller (.exe) ----------
+      - name: PyInstaller (onefile)
+        run: |
+          pyinstaller --name pdf-cleaner --onefile --console pdf_batch_remove_with_previews_and_ocr.py
+          dir dist
+
+      # ---------- Bundle final ----------
+      - name: Bundle ZIP (exe + vendor + data + runner)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bundle\data\Input | Out-Null
+          New-Item -ItemType Directory -Force -Path bundle\data\Output | Out-Null
+          New-Item -ItemType Directory -Force -Path bundle\data\OutputTxt | Out-Null
+          Copy-Item dist\pdf-cleaner.exe bundle\
+          Copy-Item vendor bundle\vendor -Recurse -Force
+          # runner .bat
+          @"
+          @echo off
+          setlocal
+          if not exist "data" mkdir "data"
+          if not exist "data\Input" mkdir "data\Input"
+          if not exist "data\Output" mkdir "data\Output"
+          if not exist "data\OutputTxt" mkdir "data\OutputTxt"
+          pdf-cleaner.exe ^
+            -i data\Input -o data\Output --dpi 300 --text-dir data\OutputTxt ^
+            --rgb-min 170 --rgb-max 250 --preview-mask --overlay ^
+            --extract-text --ocr-lang por+eng
+          echo.
+          echo PDFs: %cd%\data\Output
+          echo TXT : %cd%\data\OutputTxt
+          pause
+          endlocal
+          "@ | Out-File -Encoding ascii bundle\run_exe.bat
+
+      - name: Upload artifact (portable bundle)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf-rgb-cleaner-portable
+          path: bundle
